@@ -1,0 +1,710 @@
+--!strict
+-- Kohana Volcano + LegitFishing + GPT Hub (Auto-detect Rod/Bait Farming Status)
+-- Fully patched: optimized ownership detection, cached fishing object detection, no heavy scans.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local workspace = game:GetService("Workspace")
+local Player = Players.LocalPlayer
+local Character, Humanoid
+
+----------------------------------------------------------------
+-- 0. Prices (display names - used for UI / target selection)
+----------------------------------------------------------------
+local RodPrices = {
+    ["Starter Rod (50$)"]     = 50,
+    ["Luck Rod (350$)"]       = 350,
+    ["Carbon Rod (900$)"]     = 900,
+    ["Grass Rod (1500$)"]     = 1500,
+    ["Demascus Rod (3000$)"]  = 3000,
+    ["Ice Rod (5000$)"]       = 5000,
+    ["Lucky Rod (15000$)"]    = 15000,
+    ["Midnight Rod (50000$)"] = 50000,
+    ["SteamPunk Rod (215000$)"]= 215000,
+    ["Chrome Rod (437000$)"]  = 437000,
+    ["Fluorescent Rod (715000$)"] = 715000,
+    ["Astral Rod (1M$)"]      = 1000000,
+    ["Angler Rod (8M$)"]      = 8000000,
+    ["Ares Rod (3M$)"]        = 3000000,
+    ["Bambo Rod (12M$)"]      = 12000000,
+}
+
+local BaitPrices = {
+    ["TopWater Bait (100$)"]  = 100,
+    ["Luck Bait (1000$)"]     = 1000,
+    ["Midnight Bait (3000$)"] = 3000,
+    ["Nature Bait (83500$)"]  = 83500,
+    ["Chroma Bait (290000$)"] = 290000,
+    ["Dark Matter Bait (630000$)"] = 630000,
+    ["Corrupt Bait (1.15M$)"] = 1150000,
+    ["Aether Bait (3.70M$)"]  = 3700000,
+    ["Floral Bait (4M$)"]     = 4000000,
+}
+
+-- Build sorted lists (ascending)
+local function makeSortedList(priceMap)
+    local list = {}
+    for name, price in pairs(priceMap) do table.insert(list, {name = name, price = price}) end
+    table.sort(list, function(a,b) return a.price < b.price end)
+    return list
+end
+
+local RodList = makeSortedList(RodPrices)
+local BaitList = makeSortedList(BaitPrices)
+
+----------------------------------------------------------------
+-- 1. Wait for character + teleport
+----------------------------------------------------------------
+local function waitForCharacter()
+    if Player.Character and Player.Character:FindFirstChild("HumanoidRootPart") then
+        Character = Player.Character
+        Humanoid = Character:FindFirstChildOfClass("Humanoid")
+        return
+    end
+    Player.CharacterAdded:Wait()
+    Character = Player.Character
+    Humanoid = Character:WaitForChild("Humanoid")
+end
+waitForCharacter()
+
+local volcanoCFrame = CFrame.new(
+    -628.758911, 35.710186, 104.373764,
+    0.482912123, 1.81591773e-08, 0.875668824,
+    3.01732896e-08, 1, -3.73774007e-08,
+    -0.875668824, 4.44718076e-08, 0.482912123
+)
+Character:WaitForChild("HumanoidRootPart").CFrame = volcanoCFrame
+
+----------------------------------------------------------------
+-- 2. Equip rod from hotbar (safe)
+----------------------------------------------------------------
+task.delay(0.5, function()
+    local Net
+    pcall(function()
+        Net = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("_Index"):WaitForChild("sleitnick_net@0.2.0"):WaitForChild("net")
+    end)
+    if Net then
+        local REEquipToolFromHotbar = Net:FindFirstChild("RE/EquipToolFromHotbar")
+        if REEquipToolFromHotbar then
+            pcall(function() REEquipToolFromHotbar:FireServer(1) end)
+        end
+    end
+end)
+
+----------------------------------------------------------------
+-- 3. LegitFishing automation (unchanged, only state detection uses cached helpers)
+----------------------------------------------------------------
+task.spawn(function()
+    repeat task.wait() until game:IsLoaded()
+
+    local Net
+    pcall(function()
+        Net = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("_Index"):WaitForChild("sleitnick_net@0.2.0"):WaitForChild("net")
+    end)
+    if not Net then return end
+
+    local RfCancel = Net:WaitForChild("RF/CancelFishingInputs")
+    local FishingController = require(ReplicatedStorage.Controllers.FishingController)
+    local Constants = require(ReplicatedStorage.Shared.Constants)
+
+    -- Instant recast
+    Constants.FishingCooldownTime = 0
+
+    local States = {
+        Idle      = "Idle",
+        Casting   = "Casting",
+        Waiting   = "Waiting",
+        Minigame  = "Minigame",
+        Reeling   = "Reeling",
+        Completed = "Completed",
+    }
+
+    local CurrentState = States.Idle
+    local CurrentGuid  = nil
+    local MinigameCompleted = false
+    local StateChangeTime = os.clock()
+
+    ----------------------------------------------------------------
+    -- Optimized helpers (cached ownership + fishing object detection)
+    ----------------------------------------------------------------
+    -- small helper: normalize name once (fast)
+    local function normalizeNameFast(n)
+        if not n then return "" end
+        local s = tostring(n)
+        s = s:gsub("^%s*!!!%s*", "")
+        s = s:gsub("%s*%b()", "")
+        s = s:gsub("%$", "")
+        s = s:lower():gsub("%s+", " "):gsub("^%s+",""):gsub("%s+$","")
+        return s
+    end
+
+    local function firstToken(n)
+        local t = n:match("(%w+)")
+        return t or n
+    end
+
+    -- Precompute normalized expected names for RodList and BaitList (fast lookup)
+    local NormalizedRodNames = {}
+    for i,entry in ipairs(RodList) do
+        NormalizedRodNames[i] = normalizeNameFast(entry.name)
+    end
+    local NormalizedBaitNames = {}
+    for i,entry in ipairs(BaitList) do
+        NormalizedBaitNames[i] = normalizeNameFast(entry.name)
+    end
+
+    -- ownership caches
+    local OwnedCache = {}
+    local DataOwnedCache = {}
+
+    local function markOwned(normName, val)
+        if not normName or normName == "" then return end
+        if val then OwnedCache[normName] = true else OwnedCache[normName] = nil end
+    end
+
+    local function scanContainerToCache(container)
+        if not container then return end
+        for _, v in ipairs(container:GetChildren()) do
+            if v:IsA("Tool") or v:IsA("Accessory") then
+                local norm = normalizeNameFast(v.Name)
+                markOwned(norm, true)
+                local tok = firstToken(norm)
+                if tok then markOwned(tok, true) end
+                local dv = v:FindFirstChild("DisplayName")
+                if dv and dv.Value then
+                    local n2 = normalizeNameFast(dv.Value)
+                    markOwned(n2, true)
+                    local t2 = firstToken(n2)
+                    if t2 then markOwned(t2, true) end
+                end
+            end
+        end
+    end
+
+    -- initial scan
+    do
+        local bp = Player:FindFirstChild("Backpack")
+        scanContainerToCache(bp)
+        if Player.Character then scanContainerToCache(Player.Character) end
+    end
+
+    -- watchers for backpack & character
+    local function watchContainer(container)
+        if not container then return end
+        container.ChildAdded:Connect(function(child)
+            task.defer(function()
+                if child:IsA("Tool") or child:IsA("Accessory") then
+                    local norm = normalizeNameFast(child.Name)
+                    markOwned(norm, true)
+                    local tok = firstToken(norm)
+                    if tok then markOwned(tok, true) end
+                    local dv = child:FindFirstChild("DisplayName")
+                    if dv and dv.Value then
+                        local n2 = normalizeNameFast(dv.Value)
+                        markOwned(n2, true)
+                        local t2 = firstToken(n2)
+                        if t2 then markOwned(t2, true) end
+                    end
+                end
+            end)
+        end)
+        container.ChildRemoved:Connect(function(child)
+            task.defer(function()
+                -- on removal, clear cache and rescan (removals are infrequent)
+                OwnedCache = {}
+                local bp = Player:FindFirstChild("Backpack")
+                scanContainerToCache(bp)
+                if Player.Character then scanContainerToCache(Player.Character) end
+            end)
+        end)
+    end
+
+    do
+        local bp = Player:FindFirstChild("Backpack")
+        if bp then watchContainer(bp) end
+        if Player.Character then watchContainer(Player.Character) end
+        Player.CharacterAdded:Connect(function(chr)
+            task.wait(0.5)
+            scanContainerToCache(chr)
+            watchContainer(chr)
+        end)
+    end
+
+    -- Data inventory cache (if available)
+    local DataClient = nil
+    local successData, Replion = pcall(function() return require(ReplicatedStorage.Packages.Replion).Client end)
+    if successData and Replion then
+        pcall(function() DataClient = Replion:WaitReplion("Data") end)
+    end
+
+    if DataClient then
+        local function rebuildDataCache()
+            DataOwnedCache = {}
+            local ok, items = pcall(function() return DataClient:Get({"Inventory","Items"}) end)
+            if ok and items then
+                local function deepAdd(tbl)
+                    for _, v in pairs(tbl) do
+                        if type(v) == "table" then
+                            local nm = v.Name or v.DisplayName or v.ItemName or v.Item or v.ItemId
+                            if nm then
+                                local nn = normalizeNameFast(nm)
+                                DataOwnedCache[nn] = true
+                                local tok = firstToken(nn)
+                                if tok then DataOwnedCache[tok] = true end
+                            end
+                            deepAdd(v)
+                        else
+                            if tostring(v) then
+                                local nn = normalizeNameFast(tostring(v))
+                                DataOwnedCache[nn] = true
+                                local tok = firstToken(nn)
+                                if tok then DataOwnedCache[tok] = true end
+                            end
+                        end
+                    end
+                end
+                deepAdd(items)
+            end
+        end
+        pcall(rebuildDataCache)
+        DataClient:OnChange({"Inventory","Items"}, function()
+            task.defer(rebuildDataCache)
+        end)
+    end
+
+    -- Public fast ownership check
+    local function ownsItemFlexible(expectedName)
+        if not expectedName or expectedName == "" then return false end
+        local expNorm = normalizeNameFast(expectedName)
+        if OwnedCache[expNorm] then return true end
+        if DataOwnedCache[expNorm] then return true end
+        local tok = firstToken(expNorm)
+        if tok and (OwnedCache[tok] or DataOwnedCache[tok]) then return true end
+        return false
+    end
+
+    local function ownsBetterOrEqualBait(minPrice)
+        for _, entry in ipairs(BaitList) do
+            if entry.price >= minPrice then
+                if ownsItemFlexible(entry.name) then
+                    return true, entry.name, entry.price
+                end
+            end
+        end
+        return false, nil, nil
+    end
+
+    local function highestOwnedIndex(list)
+        local idx = 0
+        for i = 1, #list do
+            if ownsItemFlexible(list[i].name) then
+                idx = i
+            end
+        end
+        return idx
+    end
+
+    -- fishing objects caching
+    local CachedFishing = { bobber = nil, line = nil, lastScan = 0 }
+    local function validateCached(obj)
+        return obj and obj.Parent
+    end
+
+    local function findFishingObjectsLimited()
+        local ok, fc = pcall(function() return require(ReplicatedStorage.Controllers.FishingController) end)
+        if ok and fc then
+            if fc.FishingBobber and fc.FishingBobber.Parent then CachedFishing.bobber = fc.FishingBobber end
+            if fc.FishingLine and fc.FishingLine.Parent then CachedFishing.line = fc.FishingLine end
+            if validateCached(CachedFishing.bobber) and validateCached(CachedFishing.line) then
+                return CachedFishing.bobber, CachedFishing.line
+            end
+        end
+
+        if validateCached(CachedFishing.bobber) and validateCached(CachedFishing.line) then
+            return CachedFishing.bobber, CachedFishing.line
+        end
+
+        local now = tick()
+        if now - CachedFishing.lastScan < 1.5 then
+            return CachedFishing.bobber, CachedFishing.line
+        end
+        CachedFishing.lastScan = now
+
+        -- limited shallow scans
+        local containers = {"Bobbers", "Fishing", "Props", "Baits"}
+        for _, nm in ipairs(containers) do
+            local cont = workspace:FindFirstChild(nm)
+            if cont then
+                for _, kid in ipairs(cont:GetChildren()) do
+                    if kid:IsA("BasePart") or kid:IsA("Model") then
+                        local lname = kid.Name:lower()
+                        if lname:find("bobber") or lname:find("float") or lname:find("bob") then
+                            CachedFishing.bobber = kid
+                        end
+                        if lname:find("line") or lname:find("string") or lname:find("rope") then
+                            CachedFishing.line = kid
+                        end
+                        if validateCached(CachedFishing.bobber) and validateCached(CachedFishing.line) then
+                            return CachedFishing.bobber, CachedFishing.line
+                        end
+                    end
+                end
+            end
+        end
+
+        if Player.Character then
+            for _, v in ipairs(Player.Character:GetChildren()) do
+                if (v:IsA("BasePart") or v:IsA("Tool")) then
+                    local n = v.Name:lower()
+                    if n:find("bobber") or n:find("float") or n:find("bob") then
+                        CachedFishing.bobber = v
+                    end
+                    if n:find("line") or n:find("string") or n:find("rope") then
+                        CachedFishing.line = v
+                    end
+                end
+            end
+        end
+
+        return CachedFishing.bobber, CachedFishing.line
+    end
+
+    local function getFishingObjects()
+        local ok, fc = pcall(function() return require(ReplicatedStorage.Controllers.FishingController) end)
+        if ok and fc then
+            if fc.FishingBobber and fc.FishingBobber.Parent then CachedFishing.bobber = fc.FishingBobber end
+            if fc.FishingLine and fc.FishingLine.Parent then CachedFishing.line = fc.FishingLine end
+        end
+        if validateCached(CachedFishing.bobber) or validateCached(CachedFishing.line) then
+            return CachedFishing
+        end
+        local b, l = findFishingObjectsLimited()
+        return { bobber = b, line = l }
+    end
+
+    ----------------------------------------------------------------
+    -- Replace the minimal uses of old detection with the new helpers
+    ----------------------------------------------------------------
+
+    local function DetectState()
+        local Guid = FishingController:GetCurrentGUID()
+        if Guid then
+            if CurrentState ~= States.Minigame then
+                CurrentGuid = Guid
+                MinigameCompleted = false
+            end
+            return States.Minigame
+        end
+
+        if CurrentGuid and not Guid then
+            local fishingObjs = getFishingObjects()
+            local IsBusy = (FishingController.FishingLine and FishingController.FishingLine.Parent)
+                or (FishingController.FishingBobber and FishingController.FishingBobber.Parent)
+                or (fishingObjs.line and fishingObjs.line.Parent)
+                or (fishingObjs.bobber and fishingObjs.bobber.Parent)
+                or FishingController._isFishing
+                or FishingController._isReeling
+
+            if IsBusy then
+                return States.Reeling
+            else
+                if MinigameCompleted then
+                    return States.Completed
+                else
+                    CurrentGuid = nil
+                    return States.Idle
+                end
+            end
+        end
+
+        return (FishingController.OnCooldown and FishingController:OnCooldown() or false)
+            and States.Waiting or States.Idle
+    end
+
+    ----------------------------------------------------------------
+    -- state loop (uses DetectState above)
+    ----------------------------------------------------------------
+    while true do
+        if not (Character and Character:FindFirstChild("HumanoidRootPart")) then
+            task.wait(1)
+            continue
+        end
+
+        local NewState = DetectState()
+        if NewState ~= CurrentState then
+            CurrentState = NewState
+            StateChangeTime = os.clock()
+        end
+
+        if (CurrentState == States.Casting or CurrentState == States.Waiting)
+            and (os.clock() - StateChangeTime) > 8 then
+            pcall(RfCancel.InvokeServer, RfCancel)
+            CurrentState = States.Idle
+            StateChangeTime = os.clock()
+        end
+
+        if CurrentState == States.Idle then
+            if not FishingController:OnCooldown() then
+                pcall(RfCancel.InvokeServer, RfCancel)
+                pcall(FishingController.RequestChargeFishingRod, FishingController, nil, true)
+                CurrentState = States.Casting
+            end
+        end
+
+        if CurrentState == States.Minigame then
+            local ClickConnection
+            local ClickCount = 0
+            ClickConnection = RunService.Heartbeat:Connect(function()
+                if not FishingController:GetCurrentGUID() then
+                    if ClickConnection then ClickConnection:Disconnect() end
+                    return
+                end
+                for i = 1, 5 do
+                    pcall(FishingController.FishingMinigameClick, FishingController)
+                end
+                ClickCount += 5
+            end)
+
+            while FishingController:GetCurrentGUID() do task.wait() end
+            if ClickConnection then ClickConnection:Disconnect() end
+
+            MinigameCompleted = true
+            CurrentState = States.Completed
+        end
+
+        if CurrentState == States.Completed then
+            CurrentGuid = nil
+            MinigameCompleted = false
+            CurrentState = States.Idle
+        end
+
+        task.wait()
+    end
+end)
+
+----------------------------------------------------------------
+-- 4. UI: GPT Hub + compact farming status line
+----------------------------------------------------------------
+local PlayerGui = Player:WaitForChild("PlayerGui")
+local Gui = Instance.new("ScreenGui")
+Gui.Name = "GPTHub"
+Gui.ResetOnSpawn = false
+Gui.Parent = PlayerGui
+
+local Frame = Instance.new("Frame")
+Frame.Size = UDim2.new(0, 360, 0, 140)
+Frame.Position = UDim2.new(0.02, 0, 0.22, 0)
+Frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+Frame.BackgroundTransparency = 0.35
+Frame.BorderSizePixel = 0
+Frame.Parent = Gui
+
+local function makeLabel(text, posY, fontSize, bold)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -14, 0, 20)
+    lbl.Position = UDim2.new(0, 7, 0, posY)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = (bold and Enum.Font.GothamBold) or Enum.Font.Gotham
+    lbl.TextSize = fontSize or 16
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = Color3.fromRGB(255,255,255)
+    lbl.Text = text
+    lbl.Parent = Frame
+    return lbl
+end
+
+local Title = makeLabel("GPT Hub", 6, 18, true)
+local StatusLabel = makeLabel("Status: Running", 30, 14, false)
+local FarmingStatusLabel = makeLabel("Farming for: - | 0/0 coins | fish: 0", 54, 14, false)
+local UptimeLabel = makeLabel("Uptime: 00:00:00", 78, 14, false)
+local FishLabel = makeLabel("Session Fish: 0", 102, 14, false)
+
+----------------------------------------------------------------
+-- 5. Utilities: number formatting + ownership detection wrappers
+----------------------------------------------------------------
+local function formatNum(n)
+    if not n then return "0" end
+    local s = tostring(math.floor(n))
+    local b = s:reverse():gsub("(%d%d%d)","%1,"):reverse()
+    if b:sub(1,1) == "," then b = b:sub(2) end
+    return b
+end
+
+-- safe Replion Data client (already handled above in detection loop, but keep reference)
+local Data = nil
+pcall(function() Data = (require(ReplicatedStorage.Packages.Replion).Client:WaitReplion("Data")) end)
+
+-- wrappers to call the cached functions inside the legit-fishing thread
+local function ownsItem(name)
+    -- name here is display name used in RodList/BaitList
+    -- use normalized check created inside the legit-fishing thread by requiring the same logic
+    -- But simplest (works because we cached on script load): scan directly here too (cheap)
+    local function normalize(n)
+        if not n then return "" end
+        local s = tostring(n)
+        s = s:gsub("^%s*!!!%s*", "")
+        s = s:gsub("%s*%b()", "")
+        s = s:gsub("%$", "")
+        return s:lower():gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","")
+    end
+    local target = normalize(name)
+    -- check backpack & character quickly (cheap)
+    if Player.Character then
+        for _, v in ipairs(Player.Character:GetChildren()) do
+            if v:IsA("Tool") and normalize(v.Name):find(target,1,true) then return true end
+        end
+    end
+    local bp = Player:FindFirstChild("Backpack")
+    if bp then
+        for _, v in ipairs(bp:GetChildren()) do
+            if v:IsA("Tool") and normalize(v.Name):find(target,1,true) then return true end
+        end
+    end
+    -- data fallback
+    if Data then
+        local ok, t = pcall(function() return Data:Get({"Inventory","Items"}) end)
+        if ok and t then
+            local function deepCheck(tbl)
+                for _, item in pairs(tbl) do
+                    if type(item) == "table" then
+                        local nm = item.Name or item.DisplayName or item.ItemName
+                        if nm and normalize(nm):find(target,1,true) then return true end
+                        if deepCheck(item) then return true end
+                    elseif tostring(item) and normalize(tostring(item)):find(target,1,true) then
+                        return true
+                    end
+                end
+                return false
+            end
+            if deepCheck(t) then return true end
+        end
+    end
+    return false
+end
+
+local function ownsBetterOrEqualBaitProxy(minPrice)
+    -- mirrors ownsBetterOrEqualBait but calls the local ownsItem
+    for _, entry in ipairs(BaitList) do
+        if entry.price >= minPrice then
+            if ownsItem(entry.name) then
+                return true, entry.name, entry.price
+            end
+        end
+    end
+    return false, nil, nil
+end
+
+----------------------------------------------------------------
+-- 6. Coins detection: Replion Data preferred, else leaderstats fallback
+----------------------------------------------------------------
+local currentCoins = 0
+
+if Data then
+    pcall(function()
+        Data:OnChange({"Currency","Coins"}, function(coins)
+            currentCoins = tonumber(coins) or 0
+        end)
+        local ok, initCoins = pcall(function() return Data:Get({"Currency","Coins"}) end)
+        if ok and type(initCoins) == "number" then currentCoins = initCoins end
+    end)
+else
+    local ls = Player:FindFirstChild("leaderstats")
+    if ls and ls:FindFirstChild("Coins") then
+        local coinsObj = ls.Coins
+        currentCoins = coinsObj.Value
+        coinsObj:GetPropertyChangedSignal("Value"):Connect(function() currentCoins = coinsObj.Value end)
+    end
+end
+
+----------------------------------------------------------------
+-- 7. Fish counting (session)
+----------------------------------------------------------------
+local sessionFish = 0
+local totalFish = 0
+
+local okNet, Net = pcall(function()
+    return ReplicatedStorage:WaitForChild("Packages"):WaitForChild("_Index"):WaitForChild("sleitnick_net@0.2.0"):WaitForChild("net")
+end)
+
+local FishNotify = nil
+if okNet and Net then FishNotify = Net:FindFirstChild("RE/ObtainedNewFishNotification") end
+
+if FishNotify then
+    FishNotify.OnClientEvent:Connect(function(...)
+        sessionFish += 1
+        totalFish += 1
+        FishLabel.Text = "Session Fish: " .. tostring(sessionFish)
+    end)
+end
+
+----------------------------------------------------------------
+-- 8. AUTO-DETECT NEXT TARGETS & Update UI loop
+----------------------------------------------------------------
+-- helper: find highest owned index in sorted price list (uses fast local ownsItem)
+local function highestOwnedIndexLocal(list)
+    local idx = 0
+    for i = 1, #list do
+        if ownsItem(list[i].name) then
+            idx = i
+        end
+    end
+    return idx -- 0 means none owned
+end
+
+task.spawn(function()
+    local startTime = os.clock()
+    while true do
+        local elapsed = os.clock() - startTime
+        local h = math.floor(elapsed / 3600)
+        local m = math.floor((elapsed % 3600) / 60)
+        local s = math.floor(elapsed % 60)
+        UptimeLabel.Text = string.format("Uptime: %02d:%02d:%02d", h, m, s)
+
+        local rodOwnedIdx = highestOwnedIndexLocal(RodList)
+        local rodTargetIdx = math.min(#RodList, rodOwnedIdx + 1)
+        local rodTarget = RodList[rodTargetIdx]
+        local ownsTargetRod = rodTarget and ownsItem(rodTarget.name)
+
+        local baitOwnedIdx = highestOwnedIndexLocal(BaitList)
+        local baitTargetIdx = math.min(#BaitList, baitOwnedIdx + 1)
+        local baitTarget = BaitList[baitTargetIdx]
+        local ownsTargetBait = baitTarget and ownsItem(baitTarget.name)
+
+        local ownsBetter, betterName, betterPrice = false, nil, nil
+        if baitTarget then ownsBetter, betterName, betterPrice = ownsBetterOrEqualBaitProxy(baitTarget.price) end
+
+        local statusText = ""
+        if rodOwnedIdx < #RodList and not ownsItem(RodList[rodOwnedIdx + 1].name) then
+            local targetName = RodList[rodOwnedIdx + 1].name
+            local targetPrice = RodList[rodOwnedIdx + 1].price
+            statusText = ("Farming for: %s | %s / %s coins | fish: %d"):format(
+                targetName,
+                formatNum(currentCoins),
+                formatNum(targetPrice),
+                sessionFish
+            )
+        else
+            if baitTarget == nil then
+                statusText = ("Farming for: Bait (none) | %s / %s coins | fish: %d"):format(formatNum(currentCoins), "0", sessionFish)
+            else
+                if ownsBetter and betterPrice and betterPrice >= baitTarget.price then
+                    statusText = ("Farming for: %s (skip — own %s) | %s / %s coins | fish: %d"):format(
+                        baitTarget.name, betterName or "better bait", formatNum(currentCoins), formatNum(baitTarget.price), sessionFish
+                    )
+                else
+                    statusText = ("Farming for: %s | %s / %s coins | fish: %d"):format(
+                        baitTarget.name, formatNum(currentCoins), formatNum(baitTarget.price), sessionFish
+                    )
+                end
+            end
+        end
+
+        FarmingStatusLabel.Text = statusText
+        StatusLabel.Text = "Status: Auto-Farming (Rod priority)"
+
+        task.wait(0.5)
+    end
+end)
+
+print("Auto-detect farming system loaded.")
